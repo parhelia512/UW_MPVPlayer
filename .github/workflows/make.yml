@@ -23,7 +23,6 @@ jobs:
     strategy:
       matrix:
         os:
-          - macos-latest
           - ubuntu-latest
           - windows-latest
 
@@ -33,15 +32,15 @@ jobs:
         with:
           submodules: true
 
-      - name: Build on Unix
+      - name: Build
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          source '.github/workflows/setup.sh'
+          sudo bash -c 'apt-get update; apt-get install -y lazarus' >/dev/null
+          declare -rx INSTANTFPCOPTIONS='-Fu/usr/lib/lazarus/*/components/lazutils'
           instantfpc '.github/workflows/make.pas' build
 
       - name: Build on Windows
         if: runner.os == 'Windows'
         shell: powershell
-        run: |
-          pwsh -File '.github/workflows/setup.ps1'
+        run: pwsh -File .github/workflows/make.ps1
