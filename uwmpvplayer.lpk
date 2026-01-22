@@ -23,9 +23,6 @@
     </Files>
     <RequiredPkgs>
       <Item>
-        <PackageName Value="BGLControls"/>
-      </Item>
-      <Item>
         <PackageName Value="LCLBase"/>
       </Item>
       <Item>
