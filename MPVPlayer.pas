@@ -15,7 +15,7 @@
  *  implied. See the License for the specific language governing
  *  rights and limitations under the License.
  *
- *  Copyright (C) 2021-2024 URUWorks, uruworks@gmail.com.
+ *  Copyright (C) 2021-2026 URUWorks, uruworks@gmail.com.
  *
  *  Important for Unix/Linux needs:
  *    Place the following units/functions at the beginning
@@ -182,6 +182,7 @@ type
     {$ENDIF}
 
     procedure DoOnPaint(Sender: TObject);
+    procedure DoOnGLResize(Sender: TObject);
   public
     constructor Create(AOwner: TComponent); override;
     destructor Destroy; override;
@@ -238,7 +239,7 @@ type
     procedure LoadTrack(const TrackType: TMPVPlayerTrackType; const AFileName: String);
     procedure RemoveTrack(const TrackType: TMPVPlayerTrackType; const ID: Integer = -1);
     procedure ReloadTrack(const TrackType: TMPVPlayerTrackType; const ID: Integer = -1);
-    procedure ShowOverlayText(const AText: String);
+    procedure ShowOverlayText(const AText: String; const ATags: String = '{\an2}');
     procedure ShowText(const AText: String; const ADuration: Integer = 1000; const ATags: String = '{\an7}');
     procedure SetTextColor(const AValue: String);
     procedure SetTextHAlign(const AValue: String);
@@ -425,6 +426,66 @@ end;
 
 // -----------------------------------------------------------------------------
 
+function InvertLines(const Text: String): String;
+var
+  ReadPos, LineEnd, LineStart: Integer;
+  WritePos, ChunkLen: Integer;
+begin
+  if Text.IsEmpty then Exit('');
+
+  // 1. Asignación única de memoria
+  SetLength(Result, Length(Text));
+  WritePos := 1;
+
+  ReadPos := Length(Text);
+  LineEnd := ReadPos;
+
+  while ReadPos > 0 do
+  begin
+    // 2. Escanear hacia atrás buscando el inicio de la línea (o fin del anterior)
+    while (ReadPos > 0) and (Text[ReadPos] <> #10) and (Text[ReadPos] <> #13) do
+      Dec(ReadPos);
+
+    // 3. Calcular dónde empieza el texto de esta línea
+    LineStart := ReadPos + 1;
+    ChunkLen := LineEnd - LineStart + 1;
+
+    // 4. Mover el TEXTO de la línea al resultado
+    if ChunkLen > 0 then
+    begin
+      Move(Text[LineStart], Result[WritePos], ChunkLen * SizeOf(Char));
+      Inc(WritePos, ChunkLen);
+    end;
+
+    // 5. Mover el SALTO DE LÍNEA que encontramos (si lo hubo)
+    if ReadPos > 0 then
+    begin
+      // Detectar si es Windows (CRLF #13#10)
+      if (Text[ReadPos] = #10) and (ReadPos > 1) and (Text[ReadPos - 1] = #13) then
+      begin
+        Result[WritePos] := #13; Inc(WritePos);
+        Result[WritePos] := #10; Inc(WritePos);
+        Dec(ReadPos, 2); // Saltamos los dos caracteres
+      end
+      else
+      begin
+        // Salto simple (Mac o Linux)
+        Result[WritePos] := Text[ReadPos];
+        Inc(WritePos);
+        Dec(ReadPos); // Saltamos un carácter
+      end;
+    end;
+
+    // El fin de la próxima línea será donde terminamos de leer ahora
+    LineEnd := ReadPos;
+  end;
+
+  // 6. Ajuste final (por seguridad)
+  SetLength(Result, WritePos - 1);
+end;
+
+// -----------------------------------------------------------------------------
+
 { TMPVEventThread }
 
 // -----------------------------------------------------------------------------
@@ -472,32 +533,46 @@ end;
 // -----------------------------------------------------------------------------
 
 function TMPVPlayer.mpv_command_(args: array of String; const reply_userdata: Integer = 0): mpv_error;
+const
+  MAX_STACK_ARGS = 10;
+
 var
-  pArgs: array of PChar;
-  i: Integer;
+  StackArgs: array[0..MAX_STACK_ARGS] of PChar; // fast
+  DynArgs: array of PChar;                      // slow
+  pArgs: PPChar;
+  i, Count: Integer;
 begin
   Result := MPV_ERROR_INVALID_PARAMETER;
+  Count := Length(Args);
 
-  if High(Args) < 0 then
+  if Count = 0 then
     Exit
-  else if FInitialized and (mpv_command <> NIL) and (FMPV_HANDLE <> NIL) then
+  else if not (FInitialized and (FMPV_HANDLE <> NIL)) then
   begin
-    SetLength(pArgs, (Length(Args)+1));
-
-    for i := 0 to High(Args) do
-      pArgs[i] := PChar(Args[i]);
-
-    pArgs[Length(Args)] := NIL;
-
-    if reply_userdata > 0 then
-      FError := mpv_command_async(FMPV_HANDLE^, reply_userdata, PPChar(@pArgs[0]))
-    else
-      FError := mpv_command(FMPV_HANDLE^, PPChar(@pArgs[0]));
-
-    SetLength(pArgs, 0);
-  end
-  else
     FError := MPV_ERROR_UNINITIALIZED;
+    Exit(FError);
+  end;
+
+  if Count <= MAX_STACK_ARGS then
+    pArgs := @StackArgs[0]
+  else
+  begin
+    SetLength(DynArgs, Count + 1);
+    pArgs := @DynArgs[0];
+  end;
+
+  for i := 0 to Count - 1 do
+    pArgs[i] := PChar(Args[i]);
+
+  pArgs[Count] := NIL;
+
+  if reply_userdata > 0 then
+    FError := mpv_command_async(FMPV_HANDLE^, reply_userdata, pArgs)
+  else
+    FError := mpv_command(FMPV_HANDLE^, pArgs);
+
+  if Count > MAX_STACK_ARGS then
+    SetLength(DynArgs, 0);
 
   Result := FError;
 end;
@@ -884,6 +959,7 @@ begin
   FTextNodeValues[1].u.int64_  := 1;
   FTextNodeKeys[2]             := 'format';
   FTextNodeValues[2].format    := MPV_FORMAT_STRING;
+  FTextNodeValues[2].u._string := NIL;
   FTextNodeKeys[3]             := 'data';
   FTextNodeValues[3].format    := MPV_FORMAT_STRING;
   FTextNodeValues[3].u._string := NIL;
@@ -945,24 +1021,14 @@ begin
   FLastPos       := -1;
   {$ENDIF}
 
+  // 1. Callbacks y propiedades observadas
   if Assigned(mpv_unobserve_property) and Assigned(FMPV_HANDLE) then
     mpv_unobserve_property(FMPV_HANDLE^, 0);
 
   if Assigned(mpv_set_wakeup_callback) and Assigned(FMPV_HANDLE) then
     mpv_set_wakeup_callback(FMPV_HANDLE^, NIL, NIL);
 
-  FShowText := '';
-  FText := '';
-  SetLength(FTextNodeKeys, 0);
-  SetLength(FTextNodeValues, 0);
-
-  if Assigned(FMPVEvent) then
-  begin
-    FMPVEvent.Terminate;
-    FMPVEvent.WaitFor;
-    FreeAndNil(FMPVEvent);
-  end;
-
+  // 2. Detener el Renderizado
   if FRenderMode = rmOpenGL then
     UnInitializeRenderGL
   {$IFDEF SDL2}
@@ -970,10 +1036,25 @@ begin
     UnInitializeRenderSDL
   {$ENDIF};
 
+  // 3. Destruir el núcleo de MPV
   if Assigned(mpv_terminate_destroy) and Assigned(FMPV_HANDLE) then
+  begin
     mpv_terminate_destroy(FMPV_HANDLE^);
+    FMPV_HANDLE := NIL;
+  end;
 
-  FMPV_HANDLE := NIL;
+  // 4. Ahora SI es seguro liberar el hilo de eventos
+  if Assigned(FMPVEvent) then
+  begin
+    FMPVEvent.Terminate;
+    FMPVEvent.WaitFor; // Esperar a que salga de su bucle
+    FreeAndNil(FMPVEvent);
+  end;
+
+  FShowText := '';
+  FText := '';
+  SetLength(FTextNodeKeys, 0);
+  SetLength(FTextNodeValues, 0);
   SetLength(FTrackList, 0);
   FFileName := '';
   FPausePosMs := -1;
@@ -990,7 +1071,8 @@ begin
   FGL.OnClick := OnClick;
   FGL.OnMouseWheelUp   := OnMouseWheelUp;
   FGL.OnMouseWheelDown := OnMouseWheelDown;
-  FGL.OnPaint := @DoOnPaint; // force to draw opengl context when paused
+  FGL.OnPaint  := @DoOnPaint; // force to draw opengl context when paused
+  FGL.OnResize := @DoOnGLResize;
 
   FRenderGL := TMPVPlayerRenderGL.Create(FGL, FMPV_HANDLE {$IFDEF BGLCONTROLS}, FOnDrawEvent{$ENDIF});
   Result := FRenderGL.Active;
@@ -1529,7 +1611,9 @@ end;
 
 // -----------------------------------------------------------------------------
 
-procedure TMPVPlayer.ShowOverlayText(const AText: String);
+procedure TMPVPlayer.ShowOverlayText(const AText: String; const ATags: String = '{\an2}');
+var
+  FormattedText: String;
 begin
   if not FInitialized then
     Exit
@@ -1537,12 +1621,18 @@ begin
   begin
     FText := AText;
     if AText.IsEmpty then
-      FTextNodeValues[2].u._string := 'none'
+    begin
+      FTextNodeValues[2].u._string := 'none';
+      FTextNodeValues[3].u._string := '';
+    end
     else
+    begin
       FTextNodeValues[2].u._string := 'ass-events';
+      //FormattedText := '{\fscx75\fscy75\shad0}' + AText;
+      FormattedText := InvertLines(ATags + AText); // sin esto mpv invierte el orden de las lineas
+      FTextNodeValues[3].u._string := PChar(FormattedText);
+    end;
 
-    //FTextNodeValues[3].u._string := PChar(AText);
-    FTextNodeValues[3].u._string := PChar('{\fscx75\fscy75\shad0}'+AText);
     mpv_command_node_(FTextNode);
   end;
 end;
@@ -1847,6 +1937,14 @@ procedure TMPVPlayer.DoOnPaint(Sender: TObject);
 begin
   if Assigned(FRenderGL) and IsMediaLoaded and not IsPlaying then
     FRenderGL.Render(True);
+end;
+
+// -----------------------------------------------------------------------------
+
+procedure TMPVPlayer.DoOnGLResize(Sender: TObject);
+begin
+  if Assigned(FRenderGL) then
+    FRenderGL.UpdateThreadSize(FGL.ClientWidth, FGL.ClientHeight);
 end;
 
 // -----------------------------------------------------------------------------

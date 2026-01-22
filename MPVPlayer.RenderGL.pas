@@ -53,6 +53,8 @@ type
   TMPVPlayerRenderThread = class(TThread)
   private
     FGL              : TUWOpenGLControl;
+    FWidth           : Integer;
+    FHeight          : Integer;
     FError           : mpv_error;
     mpvHandle        : Pmpv_handle;
     mpvRenderParams  : array of mpv_render_param;
@@ -78,6 +80,7 @@ type
     constructor Create(AControl: TUWOpenGLControl; AHandle: Pmpv_handle; AOwner: TMPVPlayerRenderGL {$IFDEF BGLCONTROLS}; ADrawCallback: TMPVPlayerDrawEvent = NIL{$ENDIF});
     destructor Destroy; override;
     procedure Execute; override;
+    procedure UpdateSize(const AWidth, AHeight: Integer);
     procedure InvalidateContext(const AReportSwap: Boolean = True);
   end;
 
@@ -92,6 +95,7 @@ type
     destructor Destroy; override;
     procedure Terminate;
     procedure Render(const ForceInvalidate: Boolean = False);
+    procedure UpdateThreadSize(const w, h: Integer);
 
     property Active : Boolean read GetRenderActive;
   end;
@@ -151,7 +155,9 @@ begin
   {$IFDEF BGLCONTROLS}
   FDrawCallback := ADrawCallback;
   {$ENDIF}
-  FGL := AControl;
+  FGL     := AControl;
+  FWidth  := FGL.ClientWidth;
+  FHeight := FGL.ClientHeight;
   FGL.ReleaseContext;
 
   IsRenderActive         := False;
@@ -191,14 +197,16 @@ begin
   while not Terminated do
   begin
     RTLEventWaitFor(Event);
-
-    if ForceInvalidateContext then
-    begin
-      ForceInvalidateContext := False;
-      InvalidateContext(False);
-    end
-    else if IsRenderActive and ((mpv_render_context_update(mpvRenderContext^) and MPV_RENDER_UPDATE_FRAME) > 0) then //while IsRenderActive and ((mpv_render_context_update(mpvRenderContext^) and MPV_RENDER_UPDATE_FRAME) > 0) do
-      InvalidateContext;
+    try
+      if ForceInvalidateContext then
+      begin
+        ForceInvalidateContext := False;
+        InvalidateContext(False);
+      end
+      else if IsRenderActive and ((mpv_render_context_update(mpvRenderContext^) and MPV_RENDER_UPDATE_FRAME) > 0) then //while IsRenderActive and ((mpv_render_context_update(mpvRenderContext^) and MPV_RENDER_UPDATE_FRAME) > 0) do
+        InvalidateContext;
+    except
+    end;
 
     RTLEventResetEvent(Event);
   end;
@@ -276,8 +284,16 @@ procedure TMPVPlayerRenderThread.Update_mpvfbo;
 begin
   mpvfbo.internal_format := 0;
   mpvfbo.fbo := 0;
-  mpvfbo.w := FGL.ClientWidth;
-  mpvfbo.h := FGL.ClientHeight;
+  mpvfbo.w := FWidth;
+  mpvfbo.h := FHeight;
+end;
+
+// -----------------------------------------------------------------------------
+
+procedure TMPVPlayerRenderThread.UpdateSize(const AWidth, AHeight: Integer);
+begin
+  FWidth  := AWidth;
+  FHeight := AHeight;
 end;
 
 // -----------------------------------------------------------------------------
@@ -364,6 +380,14 @@ begin
     Result := FThread.IsRenderActive
   else
     Result := False;
+end;
+
+// -----------------------------------------------------------------------------
+
+procedure TMPVPlayerRenderGL.UpdateThreadSize(const w, h: Integer);
+begin
+  if Assigned(FThread) then
+    FThread.UpdateSize(w, h);
 end;
 
 // -----------------------------------------------------------------------------
