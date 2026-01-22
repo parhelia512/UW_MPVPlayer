@@ -23,6 +23,9 @@
     </Files>
     <RequiredPkgs>
       <Item>
+        <PackageName Value="LazOpenGLContext"/>
+      </Item>
+      <Item>
         <PackageName Value="LCLBase"/>
       </Item>
       <Item>
