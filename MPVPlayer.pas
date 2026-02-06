@@ -114,6 +114,7 @@ type
     FFileName       : String;
     FMPVFileName    : String;
     FYTDLPFileName  : String;
+    FFormatSettings : TFormatSettings;
     {$IFDEF USETIMER}
     FTimer          : TTimer;
     FLastPos        : Integer;
@@ -176,6 +177,7 @@ type
     procedure SetRenderMode(const AValue: TMPVPlayerRenderMode);
     procedure SetHWDec(const AValue: Boolean);
     function LogLevelToString: String;
+    procedure SetLogLevel(const AValue: TMPVPlayerLogLevel);
 
     {$IFDEF USETIMER}
     procedure DoTimer(Sender: TObject);
@@ -354,7 +356,7 @@ type
     property RendererMode: TMPVPlayerRenderMode read FRenderMode write SetRenderMode;
     property RenderFailAction : TMPVPlayerRendeFailAction read FRenderFail write FRenderFail;
     property UseHWDec: Boolean read FUseHWDec write SetHWDec;
-    property LogLevel: TMPVPlayerLogLevel read FLogLevel write FLogLevel;
+    property LogLevel: TMPVPlayerLogLevel read FLogLevel write SetLogLevel;
 
     {$IFDEF ENABLE_BACKIMAGE}
     property BackImage: TPicture read FBackImage write FBackImage;
@@ -512,8 +514,15 @@ procedure TMPVEventThread.Execute;
 begin
   while not Terminated do
   begin
-    FEvent := mpv_wait_event(FHandle^, 0);
-    if FEvent^.event_id = MPV_EVENT_NONE then Continue;
+    FEvent := mpv_wait_event(FHandle^, 0.1);
+    if FEvent^.event_id = MPV_EVENT_NONE then
+      Continue
+    else if FEvent^.event_id = MPV_EVENT_SHUTDOWN then
+      Break;
+
+    if Terminated then
+      Break;
+
     Synchronize(@HandleEvent);
   end;
 end;
@@ -633,16 +642,26 @@ end;
 // -----------------------------------------------------------------------------
 
 function TMPVPlayer.mpv_get_property_string_(const APropertyName: String; const reply_userdata: Integer = 0): String;
+var
+  TempPChar: PChar;
 begin
+  Result := '';
+
   if FInitialized and (FMPV_HANDLE <> NIL) then
   begin
     if reply_userdata > 0 then
       FError := mpv_get_property_async(FMPV_HANDLE^, reply_userdata, PChar(APropertyName), MPV_FORMAT_STRING)
     else
-      FError := mpv_get_property(FMPV_HANDLE^, PChar(APropertyName), MPV_FORMAT_STRING, @Result);
-  end
-  else
-    Result := '';
+    begin
+      TempPChar := NIL;
+      FError := mpv_get_property(FMPV_HANDLE^, PChar(APropertyName), MPV_FORMAT_STRING, @TempPChar);
+      if (FError = MPV_ERROR_SUCCESS) and (TempPChar <> NIL) then
+      begin
+        Result := StrPas(TempPChar);
+        mpv_free(TempPChar);
+      end;
+    end;
+  end;
 end;
 
 // -----------------------------------------------------------------------------
@@ -652,9 +671,9 @@ begin
   if not FInitialized or (FMPV_HANDLE = NIL) then Exit;
 
   if reply_userdata > 0 then
-    FError := mpv_set_property_async(FMPV_HANDLE^, reply_userdata, PChar(APropertyName), MPV_FORMAT_STRING, PChar(@AValue))
+    FError := mpv_set_property_async(FMPV_HANDLE^, reply_userdata, PChar(APropertyName), MPV_FORMAT_STRING, PChar(AValue))
   else
-    FError := mpv_set_property(FMPV_HANDLE^, PChar(APropertyName), MPV_FORMAT_STRING, PChar(@AValue));
+    FError := mpv_set_property(FMPV_HANDLE^, PChar(APropertyName), MPV_FORMAT_STRING, PChar(AValue));
 end;
 
 // -----------------------------------------------------------------------------
@@ -828,6 +847,13 @@ begin
   FTimer.OnTimer  := @DoTimer;
   FLastPos        := -1;
   {$ENDIF}
+
+  FFormatSettings := DefaultFormatSettings;
+  with FFormatSettings do
+  begin
+    DecimalSeparator := '.';
+    ThousandSeparator := DecimalSeparator;
+  end;
 
   with FStartOptions do
   begin
@@ -1015,6 +1041,7 @@ end;
 procedure TMPVPlayer.UnInitialize;
 begin
   if not FInitialized then Exit;
+  FInitialized := False;
 
   {$IFDEF USETIMER}
   FTimer.Enabled := False;
@@ -1028,7 +1055,7 @@ begin
   if Assigned(mpv_set_wakeup_callback) and Assigned(FMPV_HANDLE) then
     mpv_set_wakeup_callback(FMPV_HANDLE^, NIL, NIL);
 
-  // 2. Detener el Renderizado
+  // 2. Detener Renderizado
   if FRenderMode = rmOpenGL then
     UnInitializeRenderGL
   {$IFDEF SDL2}
@@ -1036,18 +1063,18 @@ begin
     UnInitializeRenderSDL
   {$ENDIF};
 
-  // 3. Destruir el núcleo de MPV
+  // 3. Destruir núcleo de MPV
   if Assigned(mpv_terminate_destroy) and Assigned(FMPV_HANDLE) then
   begin
     mpv_terminate_destroy(FMPV_HANDLE^);
     FMPV_HANDLE := NIL;
   end;
 
-  // 4. Ahora SI es seguro liberar el hilo de eventos
+  // 4. Liberar hilo de eventos
   if Assigned(FMPVEvent) then
   begin
     FMPVEvent.Terminate;
-    FMPVEvent.WaitFor; // Esperar a que salga de su bucle
+    FMPVEvent.WaitFor;
     FreeAndNil(FMPVEvent);
   end;
 
@@ -1058,7 +1085,6 @@ begin
   SetLength(FTrackList, 0);
   FFileName := '';
   FPausePosMs := -1;
-  FInitialized := False;
 end;
 
 // -----------------------------------------------------------------------------
@@ -1186,6 +1212,17 @@ begin
   else
     Result := 'no'; // complete silence
   end;
+end;
+
+// -----------------------------------------------------------------------------
+
+procedure TMPVPlayer.SetLogLevel(const AValue: TMPVPlayerLogLevel);
+begin
+  if FLogLevel = AValue then Exit;
+  FLogLevel := AValue;
+
+  if FInitialized and (FMPV_HANDLE <> NIL) then
+    mpv_request_log_messages(FMPV_HANDLE^, PChar(LogLevelToString));
 end;
 
 // -----------------------------------------------------------------------------
@@ -1339,15 +1376,17 @@ end;
 procedure TMPVPlayer.SetMediaPosInMs(const AValue: Integer);
 var
   i: Double;
+  s: String;
 begin
   if IsPaused and (AValue <= GetMediaLenInMs) then
     FPausePosMs := AValue;
 
   i := AValue / 1000.0;
   if FSMPTEMode then
-    mpv_set_property_double('time-pos', i * 1.001)
-  else
-    mpv_set_property_double('time-pos', i);
+    i := i * 1.001;
+
+  s := FloatToStr(i, FFormatSettings);
+  mpv_command_(['seek', PChar(s), 'absolute+exact']);
 end;
 
 // -----------------------------------------------------------------------------
@@ -1629,7 +1668,7 @@ begin
     begin
       FTextNodeValues[2].u._string := 'ass-events';
       //FormattedText := '{\fscx75\fscy75\shad0}' + AText;
-      FormattedText := InvertLines(ATags + AText); // sin esto mpv invierte el orden de las lineas
+      FormattedText := ATags + InvertLines(AText); // sin esto mpv invierte el orden de las lineas
       FTextNodeValues[3].u._string := PChar(FormattedText);
     end;
 
@@ -1728,8 +1767,16 @@ end;
 // -----------------------------------------------------------------------------
 
 function TMPVPlayer.GetVideoFPS: Double;
+const
+  EPSILON = 0.1;
 begin
   Result := mpv_get_property_double('container-fps');
+
+  if (Result < EPSILON) then
+    Result := mpv_get_property_double('estimated-vf-fps');
+
+  if (Result < EPSILON) then
+    Result := 23.976;
 end;
 
 // -----------------------------------------------------------------------------
@@ -1773,6 +1820,8 @@ end;
 // -----------------------------------------------------------------------------
 
 procedure TMPVPlayer.ReceivedEvent(Sender: TObject; Event: Pmpv_event);
+var
+  PropName: PChar;
 begin
   if Event = NIL then Exit;
 
@@ -1783,10 +1832,13 @@ begin
     end;
 
     MPV_EVENT_LOG_MESSAGE:
-      if Assigned(OnLogMessage) then OnLogMessage(Sender,
-        Pmpv_event_log_message(Event^.Data)^.prefix,
-        Pmpv_event_log_message(Event^.Data)^.level,
-        Pmpv_event_log_message(Event^.Data)^.Text);
+    begin
+      if (Event^.Data <> NIL) and Assigned(OnLogMessage) then
+        OnLogMessage(Sender,
+          Pmpv_event_log_message(Event^.Data)^.prefix,
+          Pmpv_event_log_message(Event^.Data)^.level,
+          Pmpv_event_log_message(Event^.Data)^.Text);
+    end;
 
     MPV_EVENT_START_FILE:
     begin
@@ -1818,7 +1870,7 @@ begin
 
     MPV_EVENT_END_FILE:
     begin
-      if Assigned(OnEndFile) then
+      if (Event^.Data <> NIL) and Assigned(OnEndFile) then
         with Pmpv_event_end_file(Event^.data)^ do
           OnEndFile(Sender, reason, error);
     end;
@@ -1839,7 +1891,7 @@ begin
 
     MPV_EVENT_GET_PROPERTY_REPLY:
     begin
-      if Assigned(OnGetReplyEvent) then
+      if (Event^.Data <> NIL) and Assigned(OnGetReplyEvent) then
         OnGetReplyEvent(Sender, Event^.reply_userdata, Event^.error, Pmpv_event_property(Event^.Data));
     end;
 
@@ -1851,13 +1903,16 @@ begin
 
     MPV_EVENT_COMMAND_REPLY:
     begin
-      if Assigned(OnCommandReplyEvent) then
+      if (Event^.Data <> NIL) and Assigned(OnCommandReplyEvent) then
         OnCommandReplyEvent(Sender, Event^.reply_userdata, Event^.error, Pmpv_event_command(Event^.Data));
     end;
 
     MPV_EVENT_PROPERTY_CHANGE:
     begin
-      if (Pmpv_event_property(Event^.Data)^.Name = 'eof-reached') then
+      if (Event^.Data = NIL) then Exit;
+      PropName := Pmpv_event_property(Event^.Data)^.Name;
+
+      if StrComp(PropName, 'eof-reached') = 0 then
       begin
         if (Pmpv_event_property(Event^.Data)^.data <> NIL) and (PInteger(Pmpv_event_property(Event^.Data)^.data)^ = 1) then
         begin
@@ -1865,14 +1920,13 @@ begin
           if Assigned(OnEndFile) then OnEndFile(Sender, MPV_END_FILE_REASON_EOF, 0);
         end;
       end
-      else if (Pmpv_event_property(Event^.Data)^.Name = 'cache-buffering-state') then //if (Pmpv_event_property(Event^.Data)^.Name = 'paused-for-cache') then
+      else if StrComp(PropName, 'cache-buffering-state') = 0 then // 'paused-for-cache'
       begin
         if Assigned(OnBuffering) and (Pmpv_event_property(Event^.Data)^.data <> NIL) then
           OnBuffering(Sender, PInteger(Pmpv_event_property(Event^.Data)^.data)^);
-      end;
-
+      end
       {$IFNDEF USETIMER}
-      if (Pmpv_event_property(Event^.Data)^.Name = 'playback-time') and (Pmpv_event_property(Event^.Data)^.format = MPV_FORMAT_INT64) then
+      else if (StrComp(PropName, 'playback-time') = 0) and (Pmpv_event_property(Event^.Data)^.format = MPV_FORMAT_INT64) then
       begin
         if Assigned(OnTimeChanged) and (Pmpv_event_property(Event^.Data)^.data <> NIL) then
           OnTimeChanged(Sender, PInteger(Pmpv_event_property(Event^.Data)^.data)^);
