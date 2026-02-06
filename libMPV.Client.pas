@@ -2090,6 +2090,7 @@ function IsLibMPV_Installed(const AFileName: String = ''): Integer;
 
 var
   hLibMPV: TLibHandle;
+  GLibMPVRefCount: Integer;
 
 // -----------------------------------------------------------------------------
 
@@ -2145,8 +2146,14 @@ end;
 
 procedure Free_libMPV;
 begin
-  if (hLibMPV <> dynlibs.NilHandle) and UnloadLibrary(hLibMPV) then
+  if InterlockedDecrement(GLibMPVRefCount) > 0 then
+    Exit;
+
+  if (hLibMPV <> dynlibs.NilHandle) then
+  begin
+    UnloadLibrary(hLibMPV);
     hLibMPV := dynlibs.NilHandle;
+  end;
 
   mpv_client_api_version := NIL;
   mpv_error_string := NIL;
@@ -2197,6 +2204,8 @@ end;
 
 function Load_libMPV(const AFileName: String = ''): Integer;
 begin
+  InterlockedIncrement(GLibMPVRefCount);
+
   if IsLibMPV_Loaded then Exit(MPV_ERROR_SUCCESS);
 
   Result := MPV_ERROR_GENERIC;
@@ -2206,7 +2215,11 @@ begin
   else
     hLibMPV := LoadLibrary(AFileName);
 
-  if (hLibMPV = dynlibs.NilHandle) then Exit;
+  if (hLibMPV = dynlibs.NilHandle) then
+  begin
+    InterlockedDecrement(GLibMPVRefCount);
+    Exit;
+  end;
 
   Pointer(mpv_client_api_version) := GetProcAddress(hLibMPV,'mpv_client_api_version');
   Pointer(mpv_error_string) := GetProcAddress(hLibMPV,'mpv_error_string');
@@ -2347,6 +2360,7 @@ initialization
   setlocale(1, 'C');
   {$ENDIF}
   hLibMPV := dynlibs.NilHandle;
+  GLibMPVRefCount := 0;
 
 // -----------------------------------------------------------------------------
 
